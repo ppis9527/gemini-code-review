@@ -1,0 +1,24 @@
+{
+  "name": "gemini-code-review",
+  "version": "1.0.0",
+  "description": "Fan-out code review CLI using Gemini — parallel per-file review, adversarial verification of critical findings, and synthesised Markdown report.",
+  "main": "review-gemini.js",
+  "bin": {
+    "gemini-review": "./review-gemini.js"
+  },
+  "scripts": {
+    "review": "node review-gemini.js"
+  },
+  "keywords": [
+    "code-review",
+    "gemini",
+    "ai",
+    "cli",
+    "static-analysis"
+  ],
+  "author": "ppis9527",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
