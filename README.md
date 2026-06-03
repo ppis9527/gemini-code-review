@@ -1,4 +1,4 @@
-# gemini-code-review
+# gemini-code-review `v2.0.0`
 
 A CLI tool that runs **AI-powered code review and analysis** using the Gemini API. Two modes: **review** (find bugs in changed code) and **analyze** (comprehensive codebase analysis).
 
@@ -137,6 +137,23 @@ The analyze mode auto-detects and scans files with these extensions:
 JavaScript/TypeScript, Python, Java/Kotlin/Scala, Go, Rust, C/C++, C#, Ruby, PHP, Swift, Dart, Elixir, Haskell, SQL, Solidity, and more. Config files (Dockerfile, Makefile) are also included.
 
 Directories like `node_modules`, `.git`, `dist`, `build`, `__pycache__`, `vendor` are automatically skipped.
+
+## Changelog
+
+### v2.0.0
+- **New Feature**: Added codebase analysis mode (`--action analyze`) that details system architecture (including Mermaid dependencies flowcharts), cyclomatic complexity, tech debt markers, SOLID design violations, and security reviews.
+- **Security Patches**:
+  - Replaced vulnerability-prone shell executions with argument-safe `spawnSync` to block command injection.
+  - Mitigated risk of API key exposure in stderr outputs.
+  - Implemented boundary XML tags and adversarial warning flags on LLM input buffers to prevent prompt injections.
+- **Robustness Improvements**:
+  - Embedded exponential backoff retry algorithms for HTTP 429/5xx codes and socket disconnects.
+  - Replaced loose recursive folder scans with strict dotfile/dotfolder avoidance.
+  - Eliminated redundant physical disk operations.
+  - Enhanced memory allocation checks with automated Phase 3 text compression.
+
+### v1.0.0
+- Initial release featuring fan-out parallel code review mode with adversarial verify loops and final synthesised Markdown output.
 
 ## License
 
