@@ -6,6 +6,15 @@ const { spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
+const VALID_LANG_REGEX = /^(?=.*[\p{L}\d])[\p{L}\d\s_'-]+$/u;
+
+function stripBOM(content) {
+    if (content.startsWith('\uFEFF')) {
+        return content.slice(1);
+    }
+    return content;
+}
+
 // ============================================================
 // CLI Arguments
 // ============================================================
@@ -14,9 +23,11 @@ let model = 'gemini-2.5-flash';
 let concurrency = 5;
 let baseRef = 'HEAD';
 let reviewMode = 'diff'; // diff | full | both
+let temp = 0.1; // default temperature: highly deterministic, preventing hallucinations
 let action = 'review';   // review | analyze
 let scanDir = null;
 let maxFileSize = 100_000; // 100KB
+let lang = 'English'; // default language
 const files = [];
 
 for (let i = 0; i < args.length; i++) {
@@ -24,9 +35,23 @@ for (let i = 0; i < args.length; i++) {
     if (args[i] === '--concurrency' && args[i + 1]) { concurrency = parseInt(args[++i], 10); continue; }
     if (args[i] === '--base' && args[i + 1]) { baseRef = args[++i]; continue; }
     if (args[i] === '--mode' && args[i + 1]) { reviewMode = args[++i]; continue; }
+    if (args[i] === '--temperature' && args[i + 1]) { temp = parseFloat(args[++i]); continue; }
     if (args[i] === '--action' && args[i + 1]) { action = args[++i]; continue; }
     if (args[i] === '--dir' && args[i + 1]) { scanDir = args[++i]; continue; }
     if (args[i] === '--max-file-size' && args[i + 1]) { maxFileSize = parseInt(args[++i], 10); continue; }
+    if (args[i] === '--lang') {
+        if (args[i + 1] !== undefined && !args[i + 1].startsWith('-')) {
+            const proposedLang = args[++i].trim();
+            if (VALID_LANG_REGEX.test(proposedLang)) {
+                lang = proposedLang;
+            } else {
+                process.stderr.write(`Warning: invalid language "${proposedLang}". Retaining "${lang}".\n`);
+            }
+        } else {
+            process.stderr.write(`Warning: --lang flag requires a value. Retaining "${lang}".\n`);
+        }
+        continue;
+    }
     if (args[i] === '--full') { reviewMode = 'full'; continue; }
     if (args[i] === '--help' || args[i] === '-h') {
         process.stdout.write(`gemini-code-review — AI-powered code review & analysis CLI
@@ -49,6 +74,8 @@ COMMON OPTIONS:
   --model <name>          Gemini model (default: gemini-2.5-flash)
   --concurrency <n>       Max parallel API calls (default: 5)
   --max-file-size <n>     Skip files larger than N bytes (default: 100000)
+  --temperature <val>     Temperature parameter for Gemini API (default: 0.1)
+  --lang <name>           Output language for final reports (default: English)
   -h, --help              Show this help
 
 EXAMPLES:
@@ -91,12 +118,16 @@ if (isNaN(maxFileSize) || maxFileSize < 1) {
 // ============================================================
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) {
-    process.stderr.write('Error: GEMINI_API_KEY environment variable is not set.\n');
+    const winMsg = '  Windows (PowerShell): $env:GEMINI_API_KEY="your_key"';
+    const unixMsg = '  Unix/Linux: export GEMINI_API_KEY="your_key"';
+    process.stderr.write(`Error: GEMINI_API_KEY environment variable is not set.\n\nPlease set it before running the script:\n${process.platform === 'win32' ? winMsg : unixMsg}\n`);
     process.exit(1);
 }
 
 // ============================================================
 // Semaphore (concurrency limiter)
+// Safe Concurrency Limiter: Slot leakage is prevented because all active tasks (HTTP calls)
+// utilize an absolute timeout of 120,000ms, ensuring they reject/resolve and invoke release().
 // ============================================================
 function createSemaphore(limit) {
     let active = 0;
@@ -115,19 +146,22 @@ function createSemaphore(limit) {
 // ============================================================
 function callGeminiRaw(prompt, responseSchema) {
     return new Promise((resolve, reject) => {
-        const requestBody = { contents: [{ parts: [{ text: prompt }] }] };
+        const requestBody = {
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+                temperature: temp
+            }
+        };
         if (responseSchema) {
-            requestBody.generationConfig = {
-                responseMimeType: 'application/json',
-                responseSchema,
-            };
+            requestBody.generationConfig.responseMimeType = 'application/json';
+            requestBody.generationConfig.responseSchema = responseSchema;
         }
         const payload = JSON.stringify(requestBody);
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
         const req = https.request(url, {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json',
+                'Content-Type': 'application/json; charset=utf-8',
                 'Content-Length': Buffer.byteLength(payload),
                 'x-goog-api-key': apiKey,
             },
@@ -143,10 +177,16 @@ function callGeminiRaw(prompt, responseSchema) {
                 }
                 try {
                     const parsed = JSON.parse(data);
-                    const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
+                    const candidate = parsed.candidates?.[0];
+                    const text = candidate?.content?.parts?.[0]?.text;
                     if (!text) {
-                        const safe = data.length > 300 ? data.slice(0, 300) + '...(truncated)' : data;
-                        reject(new Error(`Invalid response structure: ${safe}`));
+                        const finishReason = candidate?.finishReason;
+                        if (finishReason && finishReason !== 'STOP') {
+                            reject(new Error(`Gemini API call blocked by safety/policy (finishReason=${finishReason}): ${JSON.stringify(candidate)}`));
+                        } else {
+                            const safe = data.length > 300 ? data.slice(0, 300) + '...(truncated)' : data;
+                            reject(new Error(`Invalid response structure: ${safe}`));
+                        }
                         return;
                     }
                     resolve(text.trim());
@@ -297,23 +337,38 @@ function resolveFiles() {
     if (files.length > 0) return files.filter(f => fs.existsSync(f));
     if (scanDir) return scanDirectory(path.resolve(scanDir));
     if (action === 'analyze') return scanDirectory(process.cwd());
-    // Review mode: use git diff
+
+    // Review mode: resolve files from git changes (tracked, staged, untracked)
+    const resolved = new Set();
+
+    // 1. Tracked changes in current diff
     try {
         const output = gitExec('diff', '--name-only', baseRef);
-        const changed = output.trim().split('\n').filter(Boolean);
-        if (changed.length > 0) return changed.filter(f => fs.existsSync(f));
+        output.trim().split(/\r?\n/).filter(Boolean).forEach(f => resolved.add(f));
     } catch (e) {
         const errMsg = e.message?.split('\n')[0] || String(e);
         process.stderr.write(`[git] Failed to run diff against ${baseRef}: ${errMsg}\n`);
     }
+
+    // 2. Staged changes
     try {
         const output = gitExec('diff', '--name-only', '--cached');
-        return output.trim().split('\n').filter(Boolean).filter(f => fs.existsSync(f));
+        output.trim().split(/\r?\n/).filter(Boolean).forEach(f => resolved.add(f));
     } catch (e) {
         const errMsg = e.message?.split('\n')[0] || String(e);
         process.stderr.write(`[git] Failed to run diff against cached: ${errMsg}\n`);
     }
-    return [];
+
+    // 3. Untracked files
+    try {
+        const output = gitExec('ls-files', '--others', '--exclude-standard');
+        output.trim().split(/\r?\n/).filter(Boolean).forEach(f => resolved.add(f));
+    } catch (e) {
+        const errMsg = e.message?.split('\n')[0] || String(e);
+        process.stderr.write(`[git] Failed to list untracked files: ${errMsg}\n`);
+    }
+
+    return Array.from(resolved).filter(f => fs.existsSync(f));
 }
 
 // ============================================================
@@ -340,7 +395,7 @@ function detectProjectContext(rootDir) {
         const fullPath = path.join(rootDir, cfg);
         if (fs.existsSync(fullPath)) {
             try {
-                const content = fs.readFileSync(fullPath, 'utf8');
+                const content = stripBOM(fs.readFileSync(fullPath, 'utf8'));
                 context.configs[cfg] = content.length > 2000
                     ? content.slice(0, 2000) + '\n... (truncated)'
                     : content;
@@ -459,7 +514,7 @@ function mergeReviews(diffResult, fullResult) {
 async function reviewFileSingle(filePath, mode, acquire) {
     const release = await acquire();
     try {
-        const content = fs.readFileSync(filePath, 'utf8');
+        const content = await fs.promises.readFile(filePath, 'utf8');
         const diff = getDiff(filePath);
         const prompt = buildReviewPrompt(filePath, content, diff, mode);
         process.stderr.write(`[Phase 1] Reviewing: ${filePath} (${mode}${diff ? '+diff' : ''})\n`);
@@ -538,12 +593,13 @@ Return JSON: { "refuted": boolean, "reason": "explanation" }`;
 }
 
 // --- Synthesize Review Report ---
-async function synthesizeReviewReport(reviewResults, verifiedFindings) {
+async function synthesizeReviewReport(reviewResults, verifiedFindings, targetLang = 'English') {
     process.stderr.write('[Phase 3] Synthesizing final report...\n');
     const summaryData = JSON.stringify({ reviews: reviewResults, verified: verifiedFindings }, null, 2);
     const prompt = `You are a senior tech lead writing a final code review report.
 
 Given the following review results and adversarial verification outcomes, produce a well-structured Markdown report.
+You MUST write the final report (including all titles, descriptions, summaries, fixes, and table headers) entirely in "${targetLang}".
 
 Data:
 ${summaryData}
@@ -724,7 +780,7 @@ Return only valid JSON matching the schema.`;
 async function analyzeFile(filePath, acquire) {
     const release = await acquire();
     try {
-        const content = fs.readFileSync(filePath, 'utf8');
+        const content = stripBOM(fs.readFileSync(filePath, 'utf8'));
         process.stderr.write(`[Phase 1] Analyzing: ${filePath}\n`);
         const result = await callGeminiJson(
             buildAnalyzeFilePrompt(filePath, content),
@@ -803,22 +859,22 @@ Produce a detailed Markdown analysis with the following sections:
 - Assess cohesion within modules
 - Flag circular dependencies if any
 
-### 5. Data Flow
-- How data moves through the system
-- Entry points → processing → output
+### 5. Data Flow & Workflow
+- How data moves through the system (Entry points → processing → output)
+- Create a Mermaid sequence diagram (\`sequenceDiagram\`) representing the typical control/data flow between major modules, functions, or external services
 - External service interactions
 
 ### 6. Layered Analysis
 - Identify logical layers (presentation, business logic, data access, infrastructure)
 - Check for layer violations (e.g. UI directly accessing database)
 
-Be specific and reference actual file paths. Use Mermaid diagrams where helpful.`;
+Ensure all Mermaid diagrams are syntactically valid. For flowcharts, quote node labels containing special characters (like brackets or parentheses). For sequence diagrams, quote participants or descriptions if they contain special characters. For subgraphs, always quote titles if they contain spaces, colons, or parentheses.`;
 
     return callGemini(prompt);
 }
 
 // --- Phase 3: Synthesize Comprehensive Analysis Report ---
-async function synthesizeAnalysisReport(fileAnalyses, architectureAnalysis) {
+async function synthesizeAnalysisReport(fileAnalyses, architectureAnalysis, targetLang = 'English') {
     process.stderr.write('[Phase 3] Synthesizing comprehensive analysis report...\n');
 
     const stats = {
@@ -882,7 +938,7 @@ async function synthesizeAnalysisReport(fileAnalyses, architectureAnalysis) {
         process.stderr.write('[Phase 3] Warning: truncated aggregated data to fit token limit\n');
     }
 
-    const prompt = `You are a senior software architect producing the FINAL comprehensive code analysis report.
+    const prompt = `You are a senior software architect producing the FINAL comprehensive code analysis report in "${targetLang}".
 
 Combine the architecture analysis and per-file findings into a polished, actionable Markdown report.
 
@@ -904,7 +960,15 @@ Produce a report with these sections IN ORDER:
 - Key stats table (files, lines, functions, languages)
 
 ## 🏗️ Architecture Overview
-(Include the architecture analysis from Phase 2, with Mermaid dependency graph)
+- Describe the architecture pattern (MVC, layered monolith, etc.)
+- Include the Mermaid dependency graph showing module dependencies.
+
+## 🔄 Data Flow & Workflow
+- Explain how data moves through the system (e.g., user login -> authentication -> session generation -> cache update -> response)
+- Include a Mermaid sequence diagram or flowchart showing the system's runtime workflow and user interaction loops.
+
+## 🧩 Module Coupling & Cohesion
+- Assess module coupling and cohesion, and analyze separation of concerns (e.g., UI vs Business Logic, Database isolation, and architectural violations).
 
 ## 📈 Complexity Analysis
 - Per-file complexity table (file | lines | functions | complexity)
@@ -938,7 +1002,7 @@ Produce a report with these sections IN ORDER:
 ## 📁 File-by-File Summary
 - Table: file | language | lines | complexity | issues count
 
-Use clear formatting, tables, and be concise but thorough. Make it actionable.`;
+Use clear formatting, tables, and be concise but thorough. Make it actionable. The entire report (including all descriptions, diagrams, explanations, and recommendations) must be written in "${targetLang}".`;
 
     return callGemini(prompt);
 }
@@ -957,7 +1021,9 @@ async function main() {
 
     process.stderr.write(`Action: ${action}\n`);
     process.stderr.write(`Model: ${model}\n`);
+    process.stderr.write(`Temperature: ${temp}\n`);
     process.stderr.write(`Concurrency: ${concurrency}\n`);
+    process.stderr.write(`Language: ${lang}\n`);
     if (action === 'review') {
         process.stderr.write(`Mode: ${reviewMode}${reviewMode !== 'full' ? ` (base: ${baseRef})` : ''}\n`);
     }
@@ -996,7 +1062,7 @@ async function main() {
         );
 
         process.stderr.write('\n=== Phase 3: Synthesize Report ===\n');
-        const report = await synthesizeReviewReport(reviewResults, verifiedFindings);
+        const report = await synthesizeReviewReport(reviewResults, verifiedFindings, lang);
         process.stdout.write(report + '\n');
 
     } else {
@@ -1018,7 +1084,7 @@ async function main() {
 
         // Phase 3: synthesize comprehensive report
         process.stderr.write('\n=== Phase 3: Comprehensive Report ===\n');
-        const report = await synthesizeAnalysisReport(fileAnalyses, architectureAnalysis);
+        const report = await synthesizeAnalysisReport(fileAnalyses, architectureAnalysis, lang);
         process.stdout.write(report + '\n');
     }
 }

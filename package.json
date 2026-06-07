@@ -1,6 +1,6 @@
 {
   "name": "gemini-code-review",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "AI-powered code review & analysis CLI using Gemini — parallel per-file review/analysis, adversarial verification, architecture mapping, and comprehensive Markdown reports.",
   "main": "review-gemini.js",
   "bin": {
